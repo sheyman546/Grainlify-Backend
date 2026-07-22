@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"sync"
@@ -396,3 +397,53 @@ func searchSubstring(s, substr string) bool {
 
 // Ensure mockBusReady satisfies bus.Bus interface at compile time.
 var _ bus.Bus = (*mockBusReady)(nil)
+
+type mockFlappyDBPool struct {
+	db.DBPool
+	mu       sync.Mutex
+	pingErrs []error
+	pingIdx  int
+}
+
+func (m *mockFlappyDBPool) Ping(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pingIdx < len(m.pingErrs) {
+		err := m.pingErrs[m.pingIdx]
+		m.pingIdx++
+		return err
+	}
+	return nil
+}
+
+func TestReadyFlapping(t *testing.T) {
+	pool := &mockFlappyDBPool{
+		pingErrs: []error{
+			errors.New("transient db down"), // 1st call fails
+			nil,                               // 2nd call succeeds (becomes ready)
+			errors.New("transient db blip"), // 3rd call fails, but should not flap
+		},
+	}
+	d := &db.DB{Pool: pool}
+	bus := &mockBusReady{status: "CONNECTED"}
+	app := fiber.New()
+	app.Get("/ready", handlers.NewReady(d, bus))
+
+	// 1st request: should fail because DB is down
+	resp1, _ := app.Test(httptest.NewRequest("GET", "/ready", nil))
+	if resp1.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on first request, got %d", resp1.StatusCode)
+	}
+
+	// 2nd request: should succeed because DB is up
+	resp2, _ := app.Test(httptest.NewRequest("GET", "/ready", nil))
+	if resp2.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200 on second request, got %d", resp2.StatusCode)
+	}
+
+	// 3rd request: should still succeed (latch) even though Ping would fail
+	resp3, _ := app.Test(httptest.NewRequest("GET", "/ready", nil))
+	if resp3.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200 on third request (latched), got %d", resp3.StatusCode)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/jagadeesh/grainlify/backend/internal/events"
+	"github.com/jagadeesh/grainlify/backend/internal/liveness"
 	shutdownwait "github.com/jagadeesh/grainlify/backend/internal/shutdown"
 )
 
@@ -25,6 +26,10 @@ type GitHubWebhookIngestor interface {
 type GitHubWebhookConsumer struct {
 	Sub    *nats.Subscription
 	Ingest GitHubWebhookIngestor
+
+	// LivenessTracker is updated on every successfully handled message so that
+	// the /healthz endpoint can detect whether the worker is making progress.
+	LivenessTracker *liveness.Tracker
 
 	// ShutdownGracePeriod bounds how long shutdown waits for in-flight message
 	// handlers before cancelling their contexts. Defaults to
@@ -198,6 +203,10 @@ func (c *GitHubWebhookConsumer) handleMessage(ctx context.Context, msg *nats.Msg
 			return
 		}
 		slog.Error("webhook ingest failed", "error", err)
+		return
+	}
+	if c.LivenessTracker != nil {
+		c.LivenessTracker.Tick()
 	}
 }
 
@@ -219,6 +228,17 @@ type JetStreamConsumerConfig struct {
 type GitHubWebhookJetStreamConsumer struct {
 	Sub    *nats.Subscription
 	Ingest GitHubWebhookIngestor
+
+	// ShutdownGracePeriod bounds how long shutdown waits for in-flight message
+	// handlers before cancelling their contexts. Defaults to
+	// defaultShutdownGracePeriod.
+	ShutdownGracePeriod time.Duration
+
+	wg sync.WaitGroup
+
+	processingMu     sync.RWMutex
+	processingCtx    context.Context
+	cancelProcessing context.CancelFunc
 }
 
 // SubscribeJetStream creates a durable JetStream push consumer for GitHub webhook events.
@@ -248,11 +268,17 @@ func (c *GitHubWebhookJetStreamConsumer) SubscribeJetStream(
 		ackWait = 30 * time.Second
 	}
 
+	processingCtx := c.initProcessingContext(ctx)
+
 	sub, err := js.QueueSubscribe(
 		events.SubjectGitHubWebhookReceived,
 		consumerName,
 		func(msg *nats.Msg) {
-			c.handleJetStreamMessage(ctx, msg)
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				c.handleJetStreamMessage(processingCtx, msg)
+			}()
 		},
 		nats.Durable(consumerName),
 		nats.AckExplicit(),
@@ -268,7 +294,25 @@ func (c *GitHubWebhookJetStreamConsumer) SubscribeJetStream(
 
 	go func() {
 		<-ctx.Done()
-		_ = sub.Unsubscribe()
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+
+		graceCtx, cancelGrace := context.WithTimeout(context.Background(), c.shutdownGracePeriod())
+		defer cancelGrace()
+
+		if err := shutdownwait.Wait(graceCtx, &c.wg); err != nil {
+			slog.Warn("github webhook jetstream consumer shutdown grace period exceeded; cancelling in-flight messages", "error", err)
+			c.processingMu.RLock()
+			cancelProcessing := c.cancelProcessing
+			c.processingMu.RUnlock()
+			if cancelProcessing != nil {
+				cancelProcessing()
+			}
+			return
+		}
+
+		slog.Info("github webhook jetstream consumer drained in-flight messages")
 	}()
 
 	slog.Info("JetStream durable consumer started",
@@ -321,4 +365,24 @@ func (c *GitHubWebhookJetStreamConsumer) handleJetStreamMessage(ctx context.Cont
 	if err := msg.Ack(); err != nil {
 		slog.Warn("jetstream ack failed", "error", err, "delivery_id", e.DeliveryID)
 	}
+}
+
+func (c *GitHubWebhookJetStreamConsumer) initProcessingContext(ctx context.Context) context.Context {
+	c.processingMu.Lock()
+	defer c.processingMu.Unlock()
+
+	if c.cancelProcessing != nil {
+		c.cancelProcessing()
+	}
+	processingCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.processingCtx = processingCtx
+	c.cancelProcessing = cancel
+	return processingCtx
+}
+
+func (c *GitHubWebhookJetStreamConsumer) shutdownGracePeriod() time.Duration {
+	if c.ShutdownGracePeriod > 0 {
+		return c.ShutdownGracePeriod
+	}
+	return defaultShutdownGracePeriod
 }

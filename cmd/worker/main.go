@@ -10,6 +10,15 @@
 //   - [syncjobs.Worker] — polls the sync_jobs table and executes scheduled
 //     repository synchronisation tasks (sync_issues, sync_prs).
 //
+// # Liveness endpoint
+//
+// The worker exposes a minimal HTTP endpoint at /healthz on the address
+// configured by WORKER_LIVENESS_ADDR (default :9091). The endpoint returns
+// 200 OK while the worker loop is making progress and 503 Service Unavailable
+// when no progress has been detected within WORKER_LIVENESS_STALE_THRESHOLD
+// (default 30s). Set WORKER_LIVENESS_ADDR to empty to disable the server
+// entirely (useful for local development without a port conflict).
+//
 // # Configuration
 //
 // All configuration is read from environment variables (see .env.example).
@@ -27,6 +36,7 @@
 //  1. Unsubscribes the NATS subscription (GitHubWebhookConsumer.Subscribe
 //     returns when ctx.Done() fires).
 //  2. Stops the syncjobs ticker loop (syncjobs.Worker.Run returns on ctx.Done()).
+//  3. Shuts down the liveness HTTP server.
 //
 // The process then waits up to SHUTDOWN_TIMEOUT (default 10s) for in-flight
 // work to finish before closing the NATS and database connections and exiting cleanly.
@@ -36,6 +46,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -46,6 +57,7 @@ import (
 	"github.com/jagadeesh/grainlify/backend/internal/config"
 	"github.com/jagadeesh/grainlify/backend/internal/db"
 	"github.com/jagadeesh/grainlify/backend/internal/ingest"
+	"github.com/jagadeesh/grainlify/backend/internal/liveness"
 	shutdownwait "github.com/jagadeesh/grainlify/backend/internal/shutdown"
 	"github.com/jagadeesh/grainlify/backend/internal/syncjobs"
 	"github.com/jagadeesh/grainlify/backend/internal/worker"
@@ -115,6 +127,30 @@ func main() {
 		nbus.Close()
 	}()
 
+	// ---------- Liveness tracker (shared) ----------
+	livenessTracker := liveness.NewTracker(cfg.WorkerLivenessStaleThreshold)
+
+	// ---------- Liveness HTTP server (optional) ----------
+	var livenessWG sync.WaitGroup
+	livenessAddr := cfg.WorkerLivenessAddr
+	if livenessAddr != "" {
+		livenessWG.Add(1)
+		go func() {
+			defer livenessWG.Done()
+			slog.Info("starting liveness HTTP server", "addr", livenessAddr)
+			if err := livenessTracker.Serve(livenessAddr); err != nil && !errors.Is(err, context.Canceled) {
+				// http.Server.ListenAndServe returns http.ErrServerClosed on
+				// graceful shutdown, not context.Canceled. Check for both.
+				if !errors.Is(err, http.ErrServerClosed) {
+					slog.Error("liveness HTTP server error", "error", err)
+				}
+			}
+			slog.Info("liveness HTTP server stopped")
+		}()
+	} else {
+		slog.Info("liveness HTTP server disabled (WORKER_LIVENESS_ADDR is empty)")
+	}
+
 	// Root context — cancelled on shutdown signal.
 	workerCtx, stopWorkers := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopWorkers()
@@ -123,7 +159,8 @@ func main() {
 
 	// ---------- GitHub webhook consumer ----------
 	consumer := &worker.GitHubWebhookConsumer{
-		Ingest: &ingest.GitHubWebhookIngestor{Pool: dbConn.Pool},
+		Ingest:          &ingest.GitHubWebhookIngestor{Pool: dbConn.Pool},
+		LivenessTracker: livenessTracker,
 	}
 	if err := consumer.Subscribe(workerCtx, nbus.Conn(), worker.GitHubWebhookQueueGroup); err != nil {
 		slog.Error("failed to subscribe to webhook events", "error", err)
@@ -138,6 +175,7 @@ func main() {
 
 	// ---------- Sync jobs runner (concurrent) ----------
 	syncWorker := syncjobs.New(cfg, dbConn.Pool)
+	syncWorker.LivenessTracker = livenessTracker
 	workerWG.Add(1)
 	go func() {
 		defer workerWG.Done()
@@ -188,5 +226,15 @@ func main() {
 	} else {
 		slog.Info("all workers drained cleanly")
 	}
+
+	// Shut down the liveness HTTP server after workers have drained.
+	if livenessAddr != "" {
+		slog.Info("shutting down liveness HTTP server")
+		if err := livenessTracker.Shutdown(context.Background()); err != nil {
+			slog.Warn("liveness server shutdown error", "error", err)
+		}
+	}
+	livenessWG.Wait()
+
 	slog.Info("worker shutdown complete")
 }

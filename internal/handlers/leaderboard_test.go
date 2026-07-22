@@ -161,3 +161,36 @@ func TestLeaderboardEmptyDatasetReturnsEmptyResponse(t *testing.T) {
 	assert.Empty(t, body.Leaderboard)
 	assert.False(t, body.HasMore)
 }
+
+func TestLeaderboardCountQueryAccuracy(t *testing.T) {
+	pool := openTestPool(t)
+	seedLeaderboardDataset(t, pool, map[string]int{
+		"alice": 5,
+		"bob":   4,
+		"carol": 3,
+		"dave":  2,
+		"erin":  1,
+	})
+	app := newLeaderboardApp(pool)
+
+	// Test that count query returns accurate total
+	status, body := getLeaderboard(t, app, "/leaderboard?limit=10&offset=0")
+	assert.Equal(t, fiber.StatusOK, status)
+	assert.Equal(t, 5, body.Total, "count query should return 5 contributors")
+
+	// Verify that fetching all pages matches the total
+	status2, body2 := getLeaderboard(t, app, "/leaderboard?limit=2&offset=0")
+	assert.Equal(t, fiber.StatusOK, status2)
+	assert.Equal(t, 5, body2.Total, "total should be consistent across requests")
+	assert.Equal(t, 2, len(body2.Leaderboard))
+
+	status3, body3 := getLeaderboard(t, app, "/leaderboard?limit=2&offset=2")
+	assert.Equal(t, fiber.StatusOK, status3)
+	assert.Equal(t, 5, body3.Total, "total should be consistent across requests")
+	assert.Equal(t, 2, len(body3.Leaderboard))
+
+	status4, body4 := getLeaderboard(t, app, "/leaderboard?limit=2&offset=4")
+	assert.Equal(t, fiber.StatusOK, status4)
+	assert.Equal(t, 5, body4.Total, "total should be consistent across requests")
+	assert.Equal(t, 1, len(body4.Leaderboard))
+}

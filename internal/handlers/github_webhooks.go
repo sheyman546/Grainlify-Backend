@@ -1,8 +1,7 @@
 package handlers
 
 import (
-	"github.com/jagadeesh/grainlify/backend/internal/httpx"
-
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +15,7 @@ import (
 	"github.com/jagadeesh/grainlify/backend/internal/config"
 	"github.com/jagadeesh/grainlify/backend/internal/db"
 	"github.com/jagadeesh/grainlify/backend/internal/events"
+	"github.com/jagadeesh/grainlify/backend/internal/httpx"
 	"github.com/jagadeesh/grainlify/backend/internal/ingest"
 	"github.com/jagadeesh/grainlify/backend/internal/metrics"
 )
@@ -24,7 +24,11 @@ type GitHubWebhooksHandler struct {
 	cfg config.Config
 	db  *db.DB
 	bus bus.Bus
-	ing *ingest.GitHubWebhookIngestor
+	ing githubWebhookIngestor
+}
+
+type githubWebhookIngestor interface {
+	Ingest(context.Context, events.GitHubWebhookReceived) error
 }
 
 func NewGitHubWebhooksHandler(cfg config.Config, d *db.DB, b bus.Bus) *GitHubWebhooksHandler {
@@ -170,6 +174,7 @@ func (h *GitHubWebhooksHandler) Receive() fiber.Handler {
 					"delivery_id", delivery,
 					"error", err,
 				)
+				return c.SendStatus(fiber.StatusInternalServerError)
 			} else {
 				if pubErr := h.bus.Publish(c.Context(), events.SubjectGitHubWebhookReceived, b); pubErr != nil {
 					metrics.NATSPublishFailures.Inc()
@@ -177,6 +182,7 @@ func (h *GitHubWebhooksHandler) Receive() fiber.Handler {
 						"delivery_id", delivery,
 						"error", pubErr,
 					)
+					return c.SendStatus(fiber.StatusServiceUnavailable)
 				} else {
 					slog.Info("Successfully published GitHub webhook to NATS",
 						"delivery_id", delivery,
@@ -204,6 +210,7 @@ func (h *GitHubWebhooksHandler) Receive() fiber.Handler {
 					"event", event,
 					"error", err,
 				)
+				return c.SendStatus(fiber.StatusServiceUnavailable)
 			} else {
 				slog.Info("Successfully ingested GitHub webhook",
 					"delivery_id", delivery,

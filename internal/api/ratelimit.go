@@ -2,6 +2,7 @@ package api
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ func NewRateLimitMiddleware(cfg config.Config) fiber.Handler {
 				return rateLimitKey(c, cfg, rateLimitModeAuth)
 			},
 			LimitReached: func(c *fiber.Ctx) error {
+				// Fiber's limiter middleware only sets X-RateLimit-* on the
+				// success path, not here on the throttled path — set it
+				// ourselves so callers can still read their limit on a 429.
+				c.Set("X-RateLimit-Limit", strconv.Itoa(cfg.RateLimitAuthPerMin))
 				return WriteErrorEnvelope(c, fiber.StatusTooManyRequests, "too_many_requests", "rate limit exceeded")
 			},
 		})
@@ -48,6 +53,7 @@ func NewRateLimitMiddleware(cfg config.Config) fiber.Handler {
 				return rateLimitKey(c, cfg, rateLimitModePublic)
 			},
 			LimitReached: func(c *fiber.Ctx) error {
+				c.Set("X-RateLimit-Limit", strconv.Itoa(cfg.RateLimitPublicPerMin))
 				return WriteErrorEnvelope(c, fiber.StatusTooManyRequests, "too_many_requests", "rate limit exceeded")
 			},
 		})
@@ -78,7 +84,7 @@ func rateLimitModeForPath(path string) rateLimitMode {
 	case strings.HasPrefix(path, "/auth") || strings.HasPrefix(path, "/webhooks"):
 		return rateLimitModeAuth
 	case strings.HasPrefix(path, "/projects"), path == "/leaderboard", path == "/stats/landing",
-		path == "/ecosystems", path == "/open-source-week/events", path == "/profile/public":
+		strings.HasPrefix(path, "/ecosystems"), path == "/open-source-week/events", path == "/profile/public":
 		return rateLimitModePublic
 	default:
 		return rateLimitModeNone
@@ -122,7 +128,7 @@ func authenticatedUserID(c *fiber.Ctx, cfg config.Config) string {
 func clientIP(c *fiber.Ctx, trustedProxies []string) string {
 	if len(trustedProxies) > 0 {
 		remoteAddr := strings.TrimSpace(c.Context().RemoteAddr().String())
-		if isTrustedProxy(remoteAddr, trustedProxies) || isLoopbackOrUnspecified(remoteAddr) {
+		if isTrustedProxy(remoteAddr, trustedProxies) {
 			forwarded := strings.TrimSpace(c.Get(fiber.HeaderXForwardedFor))
 			if forwarded != "" {
 				parts := strings.Split(forwarded, ",")
@@ -174,19 +180,4 @@ func isTrustedProxy(remoteAddr string, trustedProxies []string) bool {
 	}
 
 	return false
-}
-
-func isLoopbackOrUnspecified(remoteAddr string) bool {
-	host := remoteAddr
-	if parsedHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		host = parsedHost
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	return ip.IsLoopback()
 }

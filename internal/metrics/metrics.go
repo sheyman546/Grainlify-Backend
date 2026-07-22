@@ -87,6 +87,18 @@ var (
 		Name:      "landing_cache_total",
 		Help:      "Total number of landing stats cache lookups by result.",
 	}, []string{"result"})
+
+	// RepoMetadataCache counts cache hits and misses for GitHub repo-metadata lookups.
+	// The "result" label is either "hit" or "miss".
+	// A "bypass" label value is recorded when the caller explicitly requests a fresh
+	// fetch, so hit/miss ratios for normal traffic can be computed independently of
+	// forced refreshes.
+	RepoMetadataCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "grainlify",
+		Subsystem: "github",
+		Name:      "repo_metadata_cache_total",
+		Help:      "Total number of GitHub repo-metadata cache lookups by result (hit, miss, bypass).",
+	}, []string{"result"})
 )
 
 // NormalizePath replaces dynamic path segments (UUIDs, numeric IDs) with ":id"

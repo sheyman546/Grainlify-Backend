@@ -149,6 +149,15 @@ type Config struct {
 	// If empty, the endpoint is unauthenticated — only acceptable when /metrics is firewalled at the network level.
 	MetricsToken string
 
+	// GitHubRepoMetadataCacheTTL is how long a cached GitHub repo-metadata response is
+	// considered fresh before it is evicted and re-fetched (GITHUB_REPO_CACHE_TTL, default 60s).
+	//
+	// Security trade-off: a longer TTL reduces GitHub API traffic but may cause the
+	// application to act on stale visibility/permission information (e.g. a repo that
+	// was made private after the cache entry was written). Keep this value short (≤5min)
+	// in production. Set to 0 to disable caching entirely.
+	GitHubRepoMetadataCacheTTL time.Duration
+
 	// RateLimitAuthPerMin is the per-minute limit for auth and webhook endpoints (RATE_LIMIT_AUTH_PER_MIN, default 60 requests/minute).
 	RateLimitAuthPerMin int
 	// RateLimitPublicPerMin is the per-minute limit for public read endpoints (RATE_LIMIT_PUBLIC_PER_MIN, default 300 requests/minute).
@@ -240,6 +249,7 @@ func Load() Config {
 		RateLimitPublicPerMin: getEnvInt("RATE_LIMIT_PUBLIC_PER_MIN", 300),
 		TrustedProxies:        parseTrustedProxies(getEnv("TRUSTED_PROXIES", "127.0.0.1,::1")),
 		MetricsToken:          strings.TrimSpace(getEnv("METRICS_TOKEN", "")),
+		GitHubRepoMetadataCacheTTL: getEnvDuration("GITHUB_REPO_CACHE_TTL", 60*time.Second),
 	}
 }
 

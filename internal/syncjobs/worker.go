@@ -19,6 +19,7 @@ import (
 	"github.com/jagadeesh/grainlify/backend/internal/config"
 	"github.com/jagadeesh/grainlify/backend/internal/db"
 	"github.com/jagadeesh/grainlify/backend/internal/github"
+	"github.com/jagadeesh/grainlify/backend/internal/liveness"
 	"github.com/jagadeesh/grainlify/backend/internal/metrics"
 )
 
@@ -28,6 +29,10 @@ type Worker struct {
 	limiter  *rate.Limiter
 	gh       *github.Client
 	workerID string
+
+	// LivenessTracker is updated on every main loop tick so that the /healthz
+	// endpoint can detect whether the worker is making progress.
+	LivenessTracker *liveness.Tracker
 }
 
 type jobState struct {
@@ -138,6 +143,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-depth.C:
 			w.refreshQueueDepth(ctx)
 		case <-t.C:
+			if w.LivenessTracker != nil {
+				w.LivenessTracker.Tick()
+			}
 			if err := w.processOne(ctx); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				slog.Error("sync worker error", "error", err)
 			}

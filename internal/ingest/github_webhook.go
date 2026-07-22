@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ ON CONFLICT (delivery_id) DO NOTHING
 `, e.DeliveryID)
 		if err != nil {
 			slog.Warn("failed to check delivery dedup", "delivery_id", e.DeliveryID, "error", err)
+			return fmt.Errorf("check delivery dedup: %w", err)
 		} else if tag.RowsAffected() == 0 {
 			return nil
 		}
@@ -294,7 +296,6 @@ func nullIfEmpty(s string) any {
 	}
 	return s
 }
-
 
 
 

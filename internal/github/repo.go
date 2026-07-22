@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/jagadeesh/grainlify/backend/internal/metrics"
 )
 
 type Repo struct {
@@ -230,6 +232,43 @@ func (c *Client) GetReadme(ctx context.Context, accessToken string, fullName str
 	}
 	// If not base64, return as-is (shouldn't happen with GitHub API)
 	return readme.Content, nil
+}
+
+// GetRepoWithCache fetches repo metadata, serving from cache when possible.
+//
+// Parameters:
+//   - cache: a *RepoCache shared across calls. If nil, the call falls through
+//     to GetRepo with no caching and no metrics.
+//   - bypass: when true the cache is skipped unconditionally and the fresh result
+//     is stored back into the cache. Use this for freshness-sensitive callers
+//     (e.g. right after a GitHub App install/uninstall) so subsequent normal
+//     callers immediately see the updated data.
+//
+// Metrics (grainlify_github_repo_metadata_cache_total):
+//   - "hit"    — entry was present and within TTL.
+//   - "miss"   — entry was absent or expired; a network fetch was performed.
+//   - "bypass" — caller forced a fresh fetch regardless of cache state.
+func (c *Client) GetRepoWithCache(ctx context.Context, accessToken, fullName string, cache *RepoCache, bypass bool) (Repo, error) {
+	if cache == nil || cache.ttl <= 0 {
+		return c.GetRepo(ctx, accessToken, fullName)
+	}
+
+	if !bypass {
+		if repo, ok := cache.Get(fullName); ok {
+			metrics.RepoMetadataCache.WithLabelValues("hit").Inc()
+			return repo, nil
+		}
+		metrics.RepoMetadataCache.WithLabelValues("miss").Inc()
+	} else {
+		metrics.RepoMetadataCache.WithLabelValues("bypass").Inc()
+	}
+
+	repo, err := c.GetRepo(ctx, accessToken, fullName)
+	if err != nil {
+		return Repo{}, err
+	}
+	cache.set(fullName, repo)
+	return repo, nil
 }
 
 func splitFullName(fullName string) (string, string, error) {

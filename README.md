@@ -249,6 +249,48 @@ make test
 go test -race -short ./...
 ```
 
+### Fuzz Testing (XDR decode helpers)
+
+The `internal/soroban` package includes Go native fuzz targets for every
+exported `Decode*` function.  These guard against a remote-DoS scenario where
+a misbehaving Soroban RPC endpoint returns truncated, type-confused, or
+otherwise adversarial XDR that could panic a request handler or worker goroutine.
+
+**Run the corpus seeds only (fast, no randomisation — identical to CI):**
+
+```bash
+go test ./internal/soroban/... -run 'TestDecodeNeverPanics|TestDecodeRoundTrip'
+```
+
+**30-second fuzz smoke run across all targets:**
+
+```bash
+go test ./internal/soroban/... -run='^$' -fuzz=FuzzDecode -fuzztime=30s
+```
+
+**Targeted long run (e.g. for the struct/map decoder):**
+
+```bash
+go test ./internal/soroban/... -run='^$' \
+  -fuzz='^FuzzDecodeScValStruct$' \
+  -fuzztime=5m
+```
+
+If the fuzzer finds a crash it writes a reproducer to
+`testdata/fuzz/<TargetName>/<hash>`.  Commit that file as a regression test
+and fix the underlying panic to return an error instead.
+
+Fuzz targets and their coverage:
+
+| Target | Decoder under test | Corpus seeds |
+|---|---|---|
+| `FuzzDecodeScValInt64` | `DecodeScValInt64` | 9 |
+| `FuzzDecodeScValString` | `DecodeScValString` | 7 |
+| `FuzzDecodeScValSymbol` | `DecodeScValSymbol` | 7 |
+| `FuzzDecodeScValAddress` | `DecodeScValAddress` | 7 |
+| `FuzzDecodeScValStruct` | `DecodeScValStruct` | 8 |
+| `FuzzDecodeScValRoundTrip` | encode→unmarshal→decode round-trip | 6 |
+
 ### Code Style
 
 - Standard Go formatting

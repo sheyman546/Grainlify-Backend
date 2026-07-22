@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,14 +17,20 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jagadeesh/grainlify/backend/internal/config"
+	"github.com/jagadeesh/grainlify/backend/internal/db"
+	"github.com/jagadeesh/grainlify/backend/internal/events"
 )
 
 // mockBus is a thread-safe in-memory bus.Bus for testing.
 // It records every Publish call so tests can assert publication behaviour.
 type mockBus struct {
-	mu   sync.Mutex
-	msgs []mockMsg
+	mu         sync.Mutex
+	msgs       []mockMsg
+	publishErr error
 }
 
 type mockMsg struct {
@@ -34,6 +41,9 @@ type mockMsg struct {
 func (b *mockBus) Publish(_ context.Context, subject string, data []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.publishErr != nil {
+		return b.publishErr
+	}
 	b.msgs = append(b.msgs, mockMsg{subject: subject, data: data})
 	return nil
 }
@@ -49,6 +59,48 @@ func (b *mockBus) published() []mockMsg {
 	copy(out, b.msgs)
 	return out
 }
+
+type stubGitHubWebhookIngestor struct {
+	err   error
+	calls int
+}
+
+func (i *stubGitHubWebhookIngestor) Ingest(context.Context, events.GitHubWebhookReceived) error {
+	i.calls++
+	return i.err
+}
+
+type failingWebhookPool struct {
+	err error
+}
+
+type failingWebhookRow struct {
+	err error
+}
+
+func (r failingWebhookRow) Scan(...any) error { return r.err }
+
+func (p failingWebhookPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, p.err
+}
+
+func (p failingWebhookPool) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, p.err
+}
+
+func (p failingWebhookPool) QueryRow(context.Context, string, ...any) pgx.Row {
+	return failingWebhookRow{err: p.err}
+}
+
+func (p failingWebhookPool) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+	return nil, p.err
+}
+
+func (p failingWebhookPool) Ping(context.Context) error { return p.err }
+
+func (p failingWebhookPool) Close() {}
+
+func (p failingWebhookPool) Config() *pgxpool.Config { return nil }
 
 // sign computes the sha256= HMAC header value as GitHub does.
 func sign(secret string, body []byte) string {
@@ -230,6 +282,47 @@ func TestReceive_ValidSignature_PublishesToBus(t *testing.T) {
 	}
 }
 
+func TestReceive_NATSPublishFailure_Returns503(t *testing.T) {
+	bus := &mockBus{publishErr: errors.New("nats unavailable")}
+	h := NewGitHubWebhooksHandler(config.Config{GitHubWebhookSecret: "secret"}, nil, bus)
+	app := newTestApp(h)
+
+	body := []byte(`{"action":"opened","repository":{"full_name":"acme/widget"}}`)
+	resp := doRequest(app, body, map[string]string{
+		"Content-Type":        "application/json",
+		"X-GitHub-Event":      "issues",
+		"X-GitHub-Delivery":   "del-retry-nats",
+		"X-Hub-Signature-256": sign("secret", body),
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("want 503 so GitHub retries, got %d", resp.StatusCode)
+	}
+}
+
+func TestReceive_NATSMarshalFailure_Returns500(t *testing.T) {
+	bus := &mockBus{}
+	h := NewGitHubWebhooksHandler(config.Config{GitHubWebhookSecret: "secret"}, nil, bus)
+	app := newTestApp(h)
+
+	body := []byte(`{`)
+	resp := doRequest(app, body, map[string]string{
+		"Content-Type":        "application/json",
+		"X-GitHub-Event":      "issues",
+		"X-GitHub-Delivery":   "del-retry-marshal",
+		"X-Hub-Signature-256": sign("secret", body),
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("want 500 so GitHub can redeliver, got %d", resp.StatusCode)
+	}
+	if got := len(bus.published()); got != 0 {
+		t.Fatalf("want no NATS publish after marshal failure, got %d", got)
+	}
+}
+
 func TestReceive_Sha1SignatureRejected(t *testing.T) {
 	h := NewGitHubWebhooksHandler(config.Config{GitHubWebhookSecret: "secret"}, nil, nil)
 	app := newTestApp(h)
@@ -268,6 +361,52 @@ func TestReceive_ValidSignature_InlinesWhenNoBus(t *testing.T) {
 
 	if resp.StatusCode != fiber.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestReceive_InlineIngestFailure_Returns503(t *testing.T) {
+	pool := failingWebhookPool{err: errors.New("database unavailable")}
+	h := NewGitHubWebhooksHandler(
+		config.Config{GitHubWebhookSecret: "s"},
+		&db.DB{Pool: pool},
+		nil,
+	)
+	app := newTestApp(h)
+
+	body := []byte(`{"action":"opened","repository":{"full_name":"acme/widget"}}`)
+	resp := doRequest(app, body, map[string]string{
+		"Content-Type":        "application/json",
+		"X-GitHub-Event":      "issues",
+		"X-GitHub-Delivery":   "del-retry-inline",
+		"X-Hub-Signature-256": sign("s", body),
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("want 503 so GitHub retries, got %d", resp.StatusCode)
+	}
+}
+
+func TestReceive_InlineIngestSuccess_Returns200(t *testing.T) {
+	ingestor := &stubGitHubWebhookIngestor{}
+	h := NewGitHubWebhooksHandler(config.Config{GitHubWebhookSecret: "s"}, nil, nil)
+	h.ing = ingestor
+	app := newTestApp(h)
+
+	body := []byte(`{"action":"opened","repository":{"full_name":"acme/widget"}}`)
+	resp := doRequest(app, body, map[string]string{
+		"Content-Type":        "application/json",
+		"X-GitHub-Event":      "issues",
+		"X-GitHub-Delivery":   "del-inline-success",
+		"X-Hub-Signature-256": sign("s", body),
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if ingestor.calls != 1 {
+		t.Fatalf("want 1 inline ingest call, got %d", ingestor.calls)
 	}
 }
 

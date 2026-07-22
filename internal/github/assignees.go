@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 // AddIssueAssignees adds assignees to a GitHub issue. Requires repo write permission (maintainer).
@@ -41,7 +43,13 @@ func (c *Client) AddIssueAssignees(ctx context.Context, accessToken string, full
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseGitHubAPIError(resp)
+		ghErr := parseGitHubAPIError(resp)
+		if apiErr, ok := ghErr.(*GitHubAPIError); ok {
+			if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+				return fiber.NewError(apiErr.StatusCode, apiErr.Message)
+			}
+		}
+		return ghErr
 	}
 	return nil
 }
@@ -78,7 +86,13 @@ func (c *Client) RemoveIssueAssignees(ctx context.Context, accessToken string, f
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseGitHubAPIError(resp)
+		ghErr := parseGitHubAPIError(resp)
+		if apiErr, ok := ghErr.(*GitHubAPIError); ok {
+			if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+				return fiber.NewError(apiErr.StatusCode, apiErr.Message)
+			}
+		}
+		return ghErr
 	}
 	return nil
 }

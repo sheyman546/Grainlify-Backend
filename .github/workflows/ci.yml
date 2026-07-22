@@ -33,3 +33,23 @@ jobs:
         # TEST_DB_URL is intentionally left unset: DB-dependent integration tests
         # detect its absence and skip themselves rather than failing.
         run: go test -count=1 -cover ./...
+
+      - name: Fuzz smoke run (XDR decode helpers)
+        # Run each fuzz target for 10 s.  The corpus seeds in testdata/fuzz/
+        # are replayed first; the fuzzer then mutates them for the remainder of
+        # the time window.  A panic or t.Fatal in any target fails the build.
+        # -run='^$' suppresses non-fuzz tests so the step is fast and focused.
+        run: |
+          for target in \
+            FuzzDecodeScValInt64 \
+            FuzzDecodeScValString \
+            FuzzDecodeScValSymbol \
+            FuzzDecodeScValAddress \
+            FuzzDecodeScValStruct \
+            FuzzDecodeScValRoundTrip; do
+            echo "--- fuzzing $target ---"
+            go test ./internal/soroban/... \
+              -run='^$' \
+              -fuzz="^${target}$" \
+              -fuzztime=10s
+          done

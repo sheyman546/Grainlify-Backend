@@ -19,9 +19,10 @@ func NewLeaderboardHandler(d *db.DB) *LeaderboardHandler {
 	return &LeaderboardHandler{db: d}
 }
 
-// leaderboardBaseQuery is the CTE-driven query shared by the data and count queries.
-// It returns username, avatar_url, user_id, contribution_count, and ecosystems
-// for all contributors in verified projects, ordered by contribution_count.
+// leaderboardBaseQuery returns username, avatar_url, user_id, contribution_count,
+// and ecosystems for all contributors in verified projects.  Issue and PR counts
+// are pre-computed once in CTEs and reused in both SELECT and WHERE — avoiding
+// the repeated correlated-subquery execution of the previous query shape.
 const leaderboardBaseQuery = `
 WITH all_contributors AS (
   SELECT DISTINCT i.author_login as login
@@ -39,23 +40,34 @@ WITH all_contributors AS (
   WHERE pr.author_login IS NOT NULL 
     AND pr.author_login != ''
     AND p.status = 'verified'
+),
+issue_counts AS (
+  SELECT
+    LOWER(i.author_login) AS login_lower,
+    COUNT(*) AS cnt
+  FROM github_issues i
+  INNER JOIN projects p ON i.project_id = p.id
+  WHERE i.author_login IS NOT NULL
+    AND i.author_login != ''
+    AND p.status = 'verified'
+  GROUP BY LOWER(i.author_login)
+),
+pr_counts AS (
+  SELECT
+    LOWER(pr.author_login) AS login_lower,
+    COUNT(*) AS cnt
+  FROM github_pull_requests pr
+  INNER JOIN projects p ON pr.project_id = p.id
+  WHERE pr.author_login IS NOT NULL
+    AND pr.author_login != ''
+    AND p.status = 'verified'
+  GROUP BY LOWER(pr.author_login)
 )
-SELECT 
+SELECT
   ac.login as username,
   COALESCE(ga.avatar_url, '') as avatar_url,
   COALESCE(u.id::text, '') as user_id,
-  (
-    SELECT COUNT(*) 
-    FROM github_issues i
-    INNER JOIN projects p ON i.project_id = p.id
-    WHERE LOWER(i.author_login) = LOWER(ac.login) AND p.status = 'verified'
-  ) +
-  (
-    SELECT COUNT(*) 
-    FROM github_pull_requests pr
-    INNER JOIN projects p ON pr.project_id = p.id
-    WHERE LOWER(pr.author_login) = LOWER(ac.login) AND p.status = 'verified'
-  ) as contribution_count,
+  (COALESCE(ic.cnt, 0) + COALESCE(pc.cnt, 0)) as contribution_count,
   COALESCE(
     (
       SELECT ARRAY_AGG(DISTINCT e.name)
@@ -76,20 +88,51 @@ SELECT
     ARRAY[]::TEXT[]
   ) as ecosystems
 FROM all_contributors ac
+LEFT JOIN issue_counts ic ON LOWER(ac.login) = ic.login_lower
+LEFT JOIN pr_counts pc ON LOWER(ac.login) = pc.login_lower
 LEFT JOIN github_accounts ga ON LOWER(ga.login) = LOWER(ac.login)
 LEFT JOIN users u ON ga.user_id = u.id
-WHERE (
-  SELECT COUNT(*) 
+WHERE (COALESCE(ic.cnt, 0) + COALESCE(pc.cnt, 0)) > 0
+`
+
+// leaderboardCountQuery is a lighter variant that skips the ecosystems
+// aggregation and the account/user joins — only the contributor-count
+// logic is needed for pagination.
+const leaderboardCountQuery = `
+WITH all_contributors AS (
+  SELECT DISTINCT i.author_login as login
   FROM github_issues i
   INNER JOIN projects p ON i.project_id = p.id
-  WHERE LOWER(i.author_login) = LOWER(ac.login) AND p.status = 'verified'
-) +
-(
-  SELECT COUNT(*) 
+  WHERE i.author_login IS NOT NULL 
+    AND i.author_login != ''
+    AND p.status = 'verified'
+  UNION
+  SELECT DISTINCT pr.author_login as login
   FROM github_pull_requests pr
   INNER JOIN projects p ON pr.project_id = p.id
-  WHERE LOWER(pr.author_login) = LOWER(ac.login) AND p.status = 'verified'
-) > 0
+  WHERE pr.author_login IS NOT NULL 
+    AND pr.author_login != ''
+    AND p.status = 'verified'
+),
+issue_counts AS (
+  SELECT LOWER(i.author_login) AS login_lower, COUNT(*) AS cnt
+  FROM github_issues i
+  INNER JOIN projects p ON i.project_id = p.id
+  WHERE i.author_login IS NOT NULL AND i.author_login != '' AND p.status = 'verified'
+  GROUP BY LOWER(i.author_login)
+),
+pr_counts AS (
+  SELECT LOWER(pr.author_login) AS login_lower, COUNT(*) AS cnt
+  FROM github_pull_requests pr
+  INNER JOIN projects p ON pr.project_id = p.id
+  WHERE pr.author_login IS NOT NULL AND pr.author_login != '' AND p.status = 'verified'
+  GROUP BY LOWER(pr.author_login)
+)
+SELECT COUNT(*)
+FROM all_contributors ac
+LEFT JOIN issue_counts ic ON LOWER(ac.login) = ic.login_lower
+LEFT JOIN pr_counts pc ON LOWER(ac.login) = pc.login_lower
+WHERE (COALESCE(ic.cnt, 0) + COALESCE(pc.cnt, 0)) > 0
 `
 
 // Leaderboard returns top contributors ranked by contributions in verified projects
@@ -165,8 +208,7 @@ LIMIT $1 OFFSET $2
 
 		// Get total count for pagination
 		var total int
-		countQuery := `SELECT COUNT(*) FROM (` + leaderboardBaseQuery + `) count_sub`
-		if err := h.db.Pool.QueryRow(c.Context(), countQuery).Scan(&total); err != nil {
+		if err := h.db.Pool.QueryRow(c.Context(), leaderboardCountQuery).Scan(&total); err != nil {
 			slog.Error("failed to count leaderboard", "error", err)
 			total = len(leaderboard)
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/jagadeesh/grainlify/backend/internal/events"
+	shutdownwait "github.com/jagadeesh/grainlify/backend/internal/shutdown"
 )
 
 type contextKey string
@@ -225,6 +226,127 @@ func TestJetStreamConsumer_IdempotentRedelivery(t *testing.T) {
 	// An idempotent ingestor processes the first, skips the second.
 	if ingestor.callCount != 2 {
 		t.Fatalf("expected ingest called 2 times (idempotency handled by ingestor), got %d", ingestor.callCount)
+	}
+}
+
+// TestGitHubWebhookJetStreamConsumerShutdownDrainsInFlightWithinGracePeriod verifies
+// that an in-flight handleJetStreamMessage call is allowed to finish (ack/nak)
+// during a shutdown that occurs mid-processing, within the grace period.
+func TestGitHubWebhookJetStreamConsumerShutdownDrainsInFlightWithinGracePeriod(t *testing.T) {
+	ingestor := &blockingIngestor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	consumer := &GitHubWebhookJetStreamConsumer{
+		Ingest:              ingestor,
+		ShutdownGracePeriod: 200 * time.Millisecond,
+	}
+	lifecycleCtx, stop := context.WithCancel(context.Background())
+	processingCtx := consumer.initProcessingContext(lifecycleCtx)
+
+	consumer.wg.Add(1)
+	go func() {
+		defer consumer.wg.Done()
+		consumer.handleJetStreamMessage(processingCtx, makeWebhookMsg(t, "jetstream-drain-delivery", "issues"))
+	}()
+
+	<-ingestor.started
+	stop()
+
+	drained := make(chan struct{})
+	go func() {
+		graceCtx, cancelGrace := context.WithTimeout(context.Background(), consumer.shutdownGracePeriod())
+		defer cancelGrace()
+		if err := shutdownwait.Wait(graceCtx, &consumer.wg); err != nil {
+			t.Errorf("shutdown wait should not exceed grace period: %v", err)
+		}
+		close(drained)
+	}()
+
+	close(ingestor.release)
+
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("consumer did not drain in-flight jetstream processing within grace period")
+	}
+	select {
+	case <-ingestor.done:
+	case <-time.After(time.Second):
+		t.Fatal("ingestor did not finish after being released")
+	}
+	if err := processingCtx.Err(); err != nil {
+		t.Fatalf("processing context was cancelled before graceful drain completed: %v", err)
+	}
+	if ingestor.count != 1 {
+		t.Fatalf("expected message to be processed exactly once, got %d", ingestor.count)
+	}
+}
+
+// TestGitHubWebhookJetStreamConsumerShutdownGracePeriodExceeded verifies that when
+// the grace period expires during shutdown, the processing context is cancelled and
+// the in-flight handler observes the cancellation.
+func TestGitHubWebhookJetStreamConsumerShutdownGracePeriodExceeded(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	ingestor := &blockingIngestor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	consumer := &GitHubWebhookJetStreamConsumer{
+		Ingest:              ingestor,
+		ShutdownGracePeriod: 10 * time.Millisecond,
+	}
+	lifecycleCtx, stop := context.WithCancel(context.Background())
+	processingCtx := consumer.initProcessingContext(lifecycleCtx)
+
+	consumer.wg.Add(1)
+	go func() {
+		defer consumer.wg.Done()
+		consumer.handleJetStreamMessage(processingCtx, makeWebhookMsg(t, "jetstream-cancel-delivery", "issues"))
+	}()
+
+	<-ingestor.started
+	stop()
+
+	// Simulate the shutdown drain — grace period is short so it will expire.
+	// This mirrors the exact logic in SubscribeJetStream's shutdown goroutine.
+	graceCtx, cancelGrace := context.WithTimeout(context.Background(), consumer.shutdownGracePeriod())
+	defer cancelGrace()
+
+	if err := shutdownwait.Wait(graceCtx, &consumer.wg); err != nil {
+		slog.Warn("github webhook jetstream consumer shutdown grace period exceeded; cancelling in-flight messages", "error", err)
+		consumer.processingMu.RLock()
+		cancelProcessing := consumer.cancelProcessing
+		consumer.processingMu.RUnlock()
+		if cancelProcessing != nil {
+			cancelProcessing()
+		}
+	}
+
+	// After cancellation, the in-flight handler should observe ctx.Done() and finish.
+	select {
+	case <-ingestor.done:
+	case <-time.After(time.Second):
+		t.Fatal("ingestor did not finish after grace period expiry")
+	}
+
+	if ingestor.count != 1 {
+		t.Fatalf("expected message to be attempted exactly once, got %d", ingestor.count)
+	}
+	if err := processingCtx.Err(); err == nil {
+		t.Fatal("expected processing context to be cancelled after grace period expiry")
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "github webhook jetstream consumer shutdown grace period exceeded") {
+		t.Fatalf("expected log warning about grace period exceeded, got logs:\n%s", logOutput)
 	}
 }
 
